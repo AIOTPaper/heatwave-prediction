@@ -1,4 +1,3 @@
-# multimodal_transformer_all_features.py
 import torch
 import torch.nn as nn
 import pandas as pd
