@@ -41,7 +41,7 @@
   - 輸出 CSV：`heatwave_data.csv`
 
 ### 2. 模型訓練
-- `multimodal_transformer_all_features.py`：
+- `multimodal_transformer.py`：
   - Temporal Transformer + Linear 層 + Dropout
   - 支援 K-Fold Cross Validation
   - Loss 曲線與 Sample Prediction 可視化
