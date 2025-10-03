@@ -1,91 +1,121 @@
-# multimodal_transformer_with_attention.py
+# multimodal_transformer_all_features.py
 import torch
 import torch.nn as nn
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, KFold
+import numpy as np
 
 # -----------------------------
 # 1. 讀取 CSV
 # -----------------------------
 df = pd.read_csv("heatwave_data.csv")
-
-sat_features = ["T2M", "WS2M", "RH2M"]
-iot_features = ["IoT_Temp", "IoT_Humidity"]
-
-X_sat = df[sat_features].values
-X_iot = df[iot_features].values
-
-# 標籤：T2M > 30°C 視為熱浪
-y = (df["T2M"] > 30).astype(int).values
-
-# 標準化
-scaler_sat = StandardScaler()
-scaler_iot = StandardScaler()
-X_sat = scaler_sat.fit_transform(X_sat)
-X_iot = scaler_iot.fit_transform(X_iot)
-
-# 轉 Torch Tensor
-X_sat = torch.tensor(X_sat, dtype=torch.float32).unsqueeze(1)  # [batch, seq_len=1, features]
-X_iot = torch.tensor(X_iot, dtype=torch.float32).unsqueeze(1)
-y = torch.tensor(y, dtype=torch.long)
+feature_cols = [c for c in df.columns if c != "date"]
+X_raw = df[feature_cols].values
+y_raw = (df["T2M"] > 30).astype(int).values  # 熱浪標籤
 
 # -----------------------------
-# 2. 定義簡化 Multi-modal Transformer
+# 2. 序列化
 # -----------------------------
-class MultiModalTransformer(nn.Module):
-    def __init__(self, sat_dim, iot_dim, hidden_dim=32, num_heads=1, num_classes=2):
+def create_sequences(X, y, seq_len=3):
+    X_seq, y_seq = [], []
+    for i in range(len(X) - seq_len + 1):
+        X_seq.append(X[i:i+seq_len])
+        y_seq.append(y[i+seq_len-1])
+    return np.array(X_seq), np.array(y_seq)
+
+X_seq, y_seq = create_sequences(X_raw, y_raw, seq_len=3)
+
+# -----------------------------
+# 3. 標準化
+# -----------------------------
+scaler = StandardScaler()
+X_flat = X_seq.reshape(-1, X_seq.shape[-1])
+X_scaled = scaler.fit_transform(X_flat).reshape(X_seq.shape)
+
+X_t = torch.tensor(X_scaled, dtype=torch.float32)
+y_t = torch.tensor(y_seq, dtype=torch.long)
+
+# -----------------------------
+# 4. Transformer 模型
+# -----------------------------
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=16, num_heads=1, num_classes=2, dropout=0.2):
         super().__init__()
-        self.sat_layer = nn.TransformerEncoderLayer(d_model=sat_dim, nhead=num_heads)
-        self.iot_layer = nn.TransformerEncoderLayer(d_model=iot_dim, nhead=num_heads)
-        self.sat_encoder = nn.TransformerEncoder(self.sat_layer, num_layers=1)
-        self.iot_encoder = nn.TransformerEncoder(self.iot_layer, num_layers=1)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, dropout=dropout)
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
         self.fc = nn.Sequential(
-            nn.Linear(sat_dim + iot_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes)
         )
 
-    def forward(self, x_sat, x_iot):
-        sat_feat = self.sat_encoder(x_sat).mean(dim=1)
-        iot_feat = self.iot_encoder(x_iot).mean(dim=1)
-        fused = torch.cat([sat_feat, iot_feat], dim=-1)
-        out = self.fc(fused)
-        return out, sat_feat, iot_feat
+    def forward(self, x):
+        feat = self.encoder(x).mean(dim=1)
+        out = self.fc(feat)
+        return out, feat
 
 # -----------------------------
-# 3. 訓練
+# 5. K-fold cross-validation
 # -----------------------------
-model = MultiModalTransformer(sat_dim=X_sat.shape[-1], iot_dim=X_iot.shape[-1])
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+kf = KFold(n_splits=5, shuffle=False)  # 時序資料不用 shuffle
+all_train_loss, all_test_loss = [], []
 
-for epoch in range(50):
-    optimizer.zero_grad()
-    outputs, sat_feat, iot_feat = model(X_sat, X_iot)
-    loss = criterion(outputs, y)
-    loss.backward()
-    optimizer.step()
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_t)):
+    X_train_t, X_test_t = X_t[train_idx], X_t[test_idx]
+    y_train_t, y_test_t = y_t[train_idx], y_t[test_idx]
 
-    if (epoch+1) % 10 == 0:
-        acc = (outputs.argmax(1) == y).float().mean()
-        print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, Acc: {acc:.4f}")
+    model = TransformerModel(input_dim=X_t.shape[-1])
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+    train_loss_list, test_loss_list = [], []
+    epochs = 50
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        outputs, _ = model(X_train_t)
+        loss = criterion(outputs, y_train_t)
+        loss.backward()
+        optimizer.step()
+        train_loss_list.append(loss.item())
+
+        # test loss
+        model.eval()
+        with torch.no_grad():
+            test_outputs, _ = model(X_test_t)
+            test_loss = criterion(test_outputs, y_test_t).item()
+            test_loss_list.append(test_loss)
+
+    all_train_loss.append(train_loss_list)
+    all_test_loss.append(test_loss_list)
+
+    print(f"✅ Fold {fold+1} done.")
 
 # -----------------------------
-# 4. Attention Heatmap（分開畫 SAT / IoT）
+# 6. 繪圖 (平均 Loss)
 # -----------------------------
-sat_attn = sat_feat.detach().numpy().mean(axis=0)
-iot_attn = iot_feat.detach().numpy().mean(axis=0)
+train_mean = np.mean(all_train_loss, axis=0)
+test_mean = np.mean(all_test_loss, axis=0)
 
-# SAT heatmap
-plt.figure(figsize=(6,1))
-sns.heatmap([sat_attn], annot=True, cmap="coolwarm", xticklabels=sat_features, yticklabels=["SAT"])
-plt.title("SAT Feature Attention")
+plt.figure(figsize=(8,4))
+plt.plot(train_mean, label="Train Loss")
+plt.plot(test_mean, label="Test Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Transformer Loss Curve (All Features, K-Fold Avg)")
+plt.legend()
 plt.show()
 
-# IoT heatmap
-plt.figure(figsize=(4,1))
-sns.heatmap([iot_attn], annot=True, cmap="coolwarm", xticklabels=iot_features, yticklabels=["IoT"])
-plt.title("IoT Feature Attention")
-plt.show()
+# -----------------------------
+# 7. 單次推論示例
+# -----------------------------
+model.eval()
+with torch.no_grad():
+    sample_outputs, _ = model(X_t)
+    predictions = sample_outputs.argmax(1).numpy()
+
+print("Sample Predictions:", predictions)
